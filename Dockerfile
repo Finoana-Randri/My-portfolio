@@ -1,71 +1,81 @@
-# To use this Dockerfile, you have to set `output: 'standalone'` in your next.config.mjs file.
-# From https://github.com/vercel/next.js/blob/canary/examples/with-docker/Dockerfile
+ARG PROXY
+FROM ${PROXY}node:22-alpine AS base
 
-FROM node:22.17.0-alpine AS base
+ARG RELEASE
+ENV NEXT_PUBLIC_RELEASE=$RELEASE
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_ENV=production
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
-# Install dependencies only when needed
+RUN apk update \
+    && apk add --no-cache \
+    ca-certificates \
+    gosu \
+    && rm -rf /var/cache/apk/*
+
+WORKDIR /app
+
+# ------------------------------------------------------------
+# DEPS
+# ------------------------------------------------------------
 FROM base AS deps
-# Check https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine to understand why libc6-compat might be needed.
-RUN apk add --no-cache libc6-compat
-WORKDIR /app
 
-# Install dependencies based on the preferred package manager
-COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* ./
-RUN \
-  if [ -f yarn.lock ]; then yarn --frozen-lockfile; \
-  elif [ -f package-lock.json ]; then npm ci; \
-  elif [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm i --frozen-lockfile; \
-  else echo "Lockfile not found." && exit 1; \
-  fi
+RUN apk add --no-cache libc6-compat ca-certificates
 
+# Correct Corepack activation
+RUN corepack enable && corepack prepare pnpm@latest --activate
 
-# Rebuild the source code only when needed
+# Copy only lockfiles → best caching
+COPY package.json pnpm-lock.yaml ./
+
+# Install dependencies
+RUN pnpm install --frozen-lockfile --prod false \
+    && pnpm store prune \
+    && rm -rf ~/.pnpm-store
+
+# ------------------------------------------------------------
+# BUILDER
+# ------------------------------------------------------------
 FROM base AS builder
-WORKDIR /app
+
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
 COPY --from=deps /app/node_modules ./node_modules
-COPY . .
 
-# Next.js collects completely anonymous telemetry data about general usage.
-# Learn more here: https://nextjs.org/telemetry
-# Uncomment the following line in case you want to disable telemetry during the build.
-# ENV NEXT_TELEMETRY_DISABLED 1
+COPY next.config.mjs tsconfig.json ./
+COPY eslint.config.mjs ./
+COPY postcss.config.mjs ./
+COPY sentry.server.config.ts sentry.edge.config.ts ./
+COPY next-sitemap.config.cjs ./
+COPY locales ./locales
 
-RUN \
-  if [ -f yarn.lock ]; then yarn run build; \
-  elif [ -f package-lock.json ]; then npm run build; \
-  elif [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm run build; \
-  else echo "Lockfile not found." && exit 1; \
-  fi
+COPY src ./src
+COPY public ./public
+COPY package.json pnpm-lock.yaml ./
 
-# Production image, copy all the files and run next
+RUN NODE_OPTIONS="--max-old-space-size=4096" pnpm lint \
+    && pnpm build \
+    && pnpm prune --prod
+
+# ------------------------------------------------------------
+# RUNNER
+# ------------------------------------------------------------
 FROM base AS runner
-WORKDIR /app
 
-ENV NODE_ENV production
-# Uncomment the following line in case you want to disable telemetry during runtime.
-# ENV NEXT_TELEMETRY_DISABLED 1
+RUN corepack enable && corepack prepare pnpm@latest --activate
 
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
+RUN addgroup -g 1001 nodejs && \
+    adduser -D -u 1001 -G nodejs nextjs
 
-# Remove this line if you do not have this folder
+COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/public ./public
-
-# Set the correct permission for prerender cache
-RUN mkdir .next
-RUN chown nextjs:nodejs .next
-
-# Automatically leverage output traces to reduce image size
-# https://nextjs.org/docs/advanced-features/output-file-tracing
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
-
-USER nextjs
+COPY --from=builder /app/locales ./locales
+COPY --from=builder /app/next.config.mjs ./next.config.mjs
+COPY --from=builder /app/next-sitemap.config.cjs ./next-sitemap.config.cjs
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/tsconfig.json ./tsconfig.json
+COPY --from=builder /app/src ./src
+COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
 
 EXPOSE 3000
-
-ENV PORT 3000
-
-# server.js is created by next build from the standalone output
-# https://nextjs.org/docs/pages/api-reference/next-config-js/output
-CMD HOSTNAME="0.0.0.0" node server.js
+CMD ["./node_modules/.bin/next", "start"]
